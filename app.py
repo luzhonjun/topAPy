@@ -2,7 +2,6 @@ import os
 from datetime import datetime
 from functools import lru_cache
 from typing import List, Dict, Any
-import subprocess
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -14,6 +13,10 @@ import time
 
 app = Flask(__name__)
 CORS(app)
+
+@app.route('/healthz')
+def healthz():
+    return jsonify({'status': 'ok'})
 
 
 def _load_tushare():
