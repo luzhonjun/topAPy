@@ -13,6 +13,7 @@ import time
 
 app = Flask(__name__)
 CORS(app)
+app.url_map.strict_slashes = False
 
 @app.route('/healthz')
 def healthz():
@@ -220,7 +221,7 @@ def get_top_new():
         else:
             df_today = pro.daily(trade_date=curr_compact)
             if df_today.empty:
-                return jsonify({'date': curr_date, 'prev_date': prev_date, 'limit': limit, 'new': [], 'message': 'no data'})
+                return jsonify({'date': curr_date, 'prev_date': prev_date, 'limit': limit, 'new': [], 'message': '该日期暂无数据'})
             if 'ts_code' in df_today.columns:
                 df_today = df_today[df_today['ts_code'].str.endswith('.SH') | df_today['ts_code'].str.endswith('.SZ')].copy()
                 df_today['__code'] = df_today['ts_code'].str.split('.').str[0]
