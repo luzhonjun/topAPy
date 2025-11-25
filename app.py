@@ -94,6 +94,18 @@ def _ensure_db_schema():
             );
             """
         )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_stock_rankings_date_rank
+            ON stock_rankings (trade_date, rank);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_stock_rankings_code_date
+            ON stock_rankings (code, trade_date);
+            """
+        )
 
 try:
     _ensure_db_schema()
@@ -483,6 +495,8 @@ def get_top_streak():
         limit = int(request.args.get('limit', '50'))
         k = int(request.args.get('k', '2'))
         date_arg = request.args.get('date')
+        db_only_arg = request.args.get('db_only', '1')
+        db_only = db_only_arg.lower() in ('1', 'true', 'yes')
         ts_mod = _load_tushare()
         token = os.getenv('TUSHARE_TOKEN')
         pro = ts_mod.pro_api(token) if token else ts_mod.pro_api()
@@ -500,47 +514,76 @@ def get_top_streak():
         _sync_calendar(pro, '20000101', end_compact)
         dates_k = _get_open_dates_from_db(end_compact, k)
         if len(dates_k) < k:
+            if db_only:
+                return jsonify({'date': end_date, 'k': k, 'limit': limit, 'list': [], 'message': 'need_ingest'}), 400
             dates_k = _get_open_dates(pro, end_compact, k)
         if not dates_k:
             return jsonify({'date': end_date, 'k': k, 'limit': limit, 'list': []})
-        name_map = _stock_name_map()
-        top_sets: List[set] = []
-        last_top: List[Dict[str, Any]] = []
-        for i, d in enumerate(dates_k):
-            d_date = _compact_to_date(d)
-            top_db = _get_top_from_db(d_date, limit)
-            if top_db:
-                top = [
-                    {
-                        'code': str(r['code']),
-                        'name': str(r.get('name', '')),
-                        'price': float(r.get('price') or 0.0),
-                        'change': float(r.get('change') or 0.0),
-                        'changePercent': float(r.get('changePercent') or 0.0),
-                        'volume': int(r.get('volume') or 0),
-                        'amount': int(r.get('amount') or 0),
-                        'date': str(r.get('date') or d_date),
-                        'rank': int(r.get('rank') or 0),
-                    }
-                    for r in top_db
-                ]
-            else:
-                df = pro.daily(trade_date=d)
-                if df.empty:
-                    top = []
-                else:
+        conn = _get_db_conn()
+        if conn:
+            dates_list = [_compact_to_date(d) for d in dates_k]
+            placeholders = ','.join(['%s'] * len(dates_list))
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT code
+                    FROM stock_rankings
+                    WHERE trade_date IN ({placeholders}) AND rank <= %s
+                    GROUP BY code
+                    HAVING COUNT(DISTINCT trade_date) = %s
+                    """,
+                    (*dates_list, limit, k),
+                )
+                rows = cur.fetchall()
+                codes = [r[0] for r in rows]
+            if not codes:
+                if db_only:
+                    return jsonify({'date': _compact_to_date(dates_k[-1]), 'k': k, 'limit': limit, 'list': [], 'message': 'need_ingest'}), 200
+                name_map = _stock_name_map()
+                for d in dates_k:
+                    df = pro.daily(trade_date=d)
+                    if df.empty:
+                        continue
                     recs = _build_daily_records_from_df(df, name_map, _compact_to_date(d))
-                    _upsert_rankings(_compact_to_date(d), recs)
-                    top = recs[:limit]
-            codes = {r['code'] for r in top}
-            top_sets.append(codes)
-            if i == len(dates_k) - 1:
-                last_top = top
-        if not top_sets:
-            return jsonify({'date': end_date, 'k': k, 'limit': limit, 'list': []})
-        common = set.intersection(*top_sets)
-        result = [r for r in last_top if r['code'] in common]
-        return jsonify({'date': _compact_to_date(dates_k[-1]), 'k': k, 'limit': limit, 'list': result})
+                    _upsert_rankings(_compact_to_date(d), recs[:limit])
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT code
+                        FROM stock_rankings
+                        WHERE trade_date IN ({placeholders}) AND rank <= %s
+                        GROUP BY code
+                        HAVING COUNT(DISTINCT trade_date) = %s
+                        """,
+                        (*dates_list, limit, k),
+                    )
+                    rows = cur.fetchall()
+                    codes = [r[0] for r in rows]
+            if not codes:
+                return jsonify({'date': _compact_to_date(dates_k[-1]), 'k': k, 'limit': limit, 'list': []})
+            codes_placeholders = ','.join(['%s'] * len(codes))
+            last_date = _compact_to_date(dates_k[-1])
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    f"""
+                    SELECT code,
+                           name,
+                           price::float8 AS price,
+                           change::float8 AS change,
+                           change_percent::float8 AS "changePercent",
+                           volume,
+                           amount,
+                           to_char(trade_date, 'YYYY-MM-DD') AS "date",
+                           rank
+                    FROM stock_rankings
+                    WHERE trade_date = %s AND rank <= %s AND code IN ({codes_placeholders})
+                    ORDER BY rank ASC
+                    """,
+                    (last_date, limit, *codes),
+                )
+                result_rows = cur.fetchall()
+            return jsonify({'date': last_date, 'k': k, 'limit': limit, 'list': result_rows})
+        return jsonify({'date': end_date, 'k': k, 'limit': limit, 'list': []})
     except Exception as e:
         return jsonify({'date': '', 'k': 0, 'limit': 0, 'list': [], 'message': str(e)})
 
@@ -656,7 +699,7 @@ def rankings_stats():
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                SELECT trade_date AS date, COUNT(*) AS count
+                SELECT to_char(trade_date, 'YYYY-MM-DD') AS date, COUNT(*) AS count
                 FROM stock_rankings
                 WHERE trade_date BETWEEN %s AND %s
                 GROUP BY trade_date
@@ -679,7 +722,9 @@ def calendar_stats():
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                SELECT MIN(cal_date) AS min_date, MAX(cal_date) AS max_date, COUNT(*) AS total
+                SELECT to_char(MIN(cal_date), 'YYYY-MM-DD') AS min_date,
+                       to_char(MAX(cal_date), 'YYYY-MM-DD') AS max_date,
+                       COUNT(*) AS total
                 FROM trading_calendar
                 WHERE exchange = %s AND is_open = true
                 """,
@@ -688,7 +733,7 @@ def calendar_stats():
             agg = cur.fetchone()
             cur.execute(
                 """
-                SELECT cal_date AS date
+                SELECT to_char(cal_date, 'YYYY-MM-DD') AS date
                 FROM trading_calendar
                 WHERE exchange = %s AND is_open = true
                 ORDER BY cal_date DESC
@@ -700,6 +745,41 @@ def calendar_stats():
         return jsonify({'exchange': exchange, 'aggregate': agg, 'last10': last10})
     except Exception as e:
         return jsonify({'message': str(e), 'exchange': '', 'aggregate': {}, 'last10': []})
+
+@app.route('/api/admin/ingest_recent', methods=['POST', 'GET'])
+def ingest_recent():
+    try:
+        conn = _get_db_conn()
+        if not conn:
+            return jsonify({'message': '数据库连接失败: 未检测到有效的 DATABASE_URL', 'days': 0, 'rows': 0}), 500
+        days = int(request.args.get('days', '7'))
+        limit = int(request.args.get('limit', '200'))
+        ts_mod = _load_tushare()
+        token = os.getenv('TUSHARE_TOKEN')
+        pro = ts_mod.pro_api(token) if token else ts_mod.pro_api()
+        today = datetime.now().strftime('%Y%m%d')
+        cal = pro.trade_cal(exchange='SSE', start_date='20000101', end_date=today, is_open=1)
+        cal = cal.sort_values(by='cal_date')
+        open_dates = cal['cal_date'].tolist()
+        if not open_dates:
+            return jsonify({'message': '未获取到交易日历', 'days': 0, 'rows': 0})
+        end_compact = open_dates[-1]
+        start_idx = max(0, len(open_dates) - days)
+        recent_dates = open_dates[start_idx:]
+        _sync_calendar(pro, recent_dates[0], recent_dates[-1])
+        name_map = _stock_name_map()
+        total_rows = 0
+        for d in recent_dates:
+            df = pro.daily(trade_date=d)
+            if df.empty:
+                continue
+            recs = _build_daily_records_from_df(df, name_map, _compact_to_date(d))
+            recs_ingest = recs[:limit]
+            _upsert_rankings(_compact_to_date(d), recs_ingest)
+            total_rows += len(recs_ingest)
+        return jsonify({'days': len(recent_dates), 'rows': total_rows, 'start': _compact_to_date(recent_dates[0]), 'end': _compact_to_date(recent_dates[-1])})
+    except Exception as e:
+        return jsonify({'message': str(e), 'days': 0, 'rows': 0})
 
 if __name__ == '__main__':
     _ensure_db_schema()
