@@ -146,8 +146,15 @@ def _get_top_from_db(date_str: str, limit: int) -> List[Dict[str, Any]]:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
-            SELECT code, name, price, change, change_percent AS "changePercent",
-                   volume, amount, trade_date AS "date", rank
+            SELECT code,
+                   name,
+                   price::float8 AS price,
+                   change::float8 AS change,
+                   change_percent::float8 AS "changePercent",
+                   volume,
+                   amount,
+                   to_char(trade_date, 'YYYY-MM-DD') AS "date",
+                   rank
             FROM stock_rankings
             WHERE trade_date = %s
             ORDER BY rank ASC
@@ -503,7 +510,20 @@ def get_top_streak():
             d_date = _compact_to_date(d)
             top_db = _get_top_from_db(d_date, limit)
             if top_db:
-                top = top_db
+                top = [
+                    {
+                        'code': str(r['code']),
+                        'name': str(r.get('name', '')),
+                        'price': float(r.get('price') or 0.0),
+                        'change': float(r.get('change') or 0.0),
+                        'changePercent': float(r.get('changePercent') or 0.0),
+                        'volume': int(r.get('volume') or 0),
+                        'amount': int(r.get('amount') or 0),
+                        'date': str(r.get('date') or d_date),
+                        'rank': int(r.get('rank') or 0),
+                    }
+                    for r in top_db
+                ]
             else:
                 df = pro.daily(trade_date=d)
                 if df.empty:
@@ -557,7 +577,7 @@ def get_stock_history():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     """
-                    SELECT trade_date AS "date", amount, rank
+                    SELECT to_char(trade_date, 'YYYY-MM-DD') AS "date", amount, rank
                     FROM stock_rankings
                     WHERE code = %s AND trade_date BETWEEN %s::date - (%s::int - 1) * INTERVAL '1 day' AND %s::date
                     ORDER BY trade_date ASC
