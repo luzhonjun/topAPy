@@ -584,6 +584,42 @@ def get_stock_history():
     except Exception as e:
         return jsonify({'code': '', 'days': 0, 'history': [], 'message': str(e)})
 
+@app.route('/api/admin/ingest', methods=['GET', 'POST'])
+def ingest_bulk():
+    try:
+        start = request.args.get('start')
+        end = request.args.get('end')
+        limit = int(request.args.get('limit', '200'))
+        exchange = request.args.get('exchange', 'SSE')
+        if not start or not end:
+            return jsonify({'message': '缺少 start/end 参数'}), 400
+        ts_mod = _load_tushare()
+        token = os.getenv('TUSHARE_TOKEN')
+        pro = ts_mod.pro_api(token) if token else ts_mod.pro_api()
+        start_compact = _date_to_compact(start)
+        end_compact = _date_to_compact(end)
+        _sync_calendar(pro, start_compact, end_compact)
+        cal = pro.trade_cal(exchange=exchange, start_date=start_compact, end_date=end_compact, is_open=1)
+        cal = cal.sort_values(by='cal_date')
+        open_dates = cal['cal_date'].tolist()
+        if not open_dates:
+            return jsonify({'exchange': exchange, 'start': start, 'end': end, 'days': 0, 'rows': 0})
+        name_map = _stock_name_map()
+        total_rows = 0
+        days_count = 0
+        for d in open_dates:
+            df = pro.daily(trade_date=d)
+            if df.empty:
+                continue
+            recs = _build_daily_records_from_df(df, name_map, _compact_to_date(d))
+            recs_ingest = recs[:limit]
+            _upsert_rankings(_compact_to_date(d), recs_ingest)
+            total_rows += len(recs_ingest)
+            days_count += 1
+        return jsonify({'exchange': exchange, 'start': start, 'end': end, 'days': days_count, 'rows': total_rows})
+    except Exception as e:
+        return jsonify({'message': str(e), 'exchange': '', 'start': '', 'end': '', 'days': 0, 'rows': 0})
+
 if __name__ == '__main__':
     _ensure_db_schema()
     port = int(os.getenv('PORT', '5000'))
