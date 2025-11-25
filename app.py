@@ -522,7 +522,8 @@ def get_top_streak():
             )
             date_rows = cur.fetchall()
         if not date_rows or len(date_rows) < k:
-            return jsonify({'date': end_date, 'k': k, 'limit': limit, 'list': [], 'message': 'need_ingest'}), 200
+            end_str = end_date.strftime('%Y-%m-%d') if hasattr(end_date, 'strftime') else str(end_date)
+            return jsonify({'date': end_str, 'k': k, 'limit': limit, 'list': [], 'message': 'need_ingest'}), 200
         dates_list = [dr[0] for dr in reversed(date_rows)]
         placeholders = ','.join(['%s'] * len(dates_list))
         with conn.cursor() as cur:
@@ -539,9 +540,12 @@ def get_top_streak():
             rows = cur.fetchall()
             codes = [r[0] for r in rows]
         if not codes:
-            return jsonify({'date': dates_list[-1], 'k': k, 'limit': limit, 'list': []})
+            last_date = dates_list[-1]
+            last_date_str = last_date.strftime('%Y-%m-%d') if hasattr(last_date, 'strftime') else str(last_date)
+            return jsonify({'date': last_date_str, 'k': k, 'limit': limit, 'list': []})
         codes_placeholders = ','.join(['%s'] * len(codes))
         last_date = dates_list[-1]
+        last_date_str = last_date.strftime('%Y-%m-%d') if hasattr(last_date, 'strftime') else str(last_date)
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 f"""
@@ -561,7 +565,7 @@ def get_top_streak():
                 (last_date, limit, *codes),
             )
             result_rows = cur.fetchall()
-        return jsonify({'date': last_date, 'k': k, 'limit': limit, 'list': result_rows})
+        return jsonify({'date': last_date_str, 'k': k, 'limit': limit, 'list': result_rows})
     except Exception as e:
         return jsonify({'date': '', 'k': 0, 'limit': 0, 'list': [], 'message': str(e)})
 
@@ -572,58 +576,65 @@ def get_stock_history():
         days = int(request.args.get('days', '30'))
         date_arg = request.args.get('date')
         if not code:
-            return jsonify({'code': '', 'days': days, 'history': []})
-        ts_mod = _load_tushare()
-        token = os.getenv('TUSHARE_TOKEN')
-        pro = ts_mod.pro_api(token) if token else ts_mod.pro_api()
+            return jsonify({'code': '', 'name': '', 'days': days, 'history': []})
+        conn = _get_db_conn()
+        if not conn:
+            return jsonify({'code': code, 'name': '', 'days': days, 'history': [], 'message': '数据库连接失败'}), 500
         if date_arg:
             end_date = date_arg
-            end_compact = _date_to_compact(date_arg)
         else:
-            today = datetime.now().strftime('%Y%m%d')
-            cal = pro.trade_cal(exchange='SSE', start_date='20000101', end_date=today, is_open=1)
-            cal = cal.sort_values(by='cal_date')
-            open_dates = cal['cal_date'].tolist()
-            d = open_dates[-1] if open_dates else today
-            end_compact = d
-            end_date = _compact_to_date(d)
-        _sync_calendar(pro, '20000101', end_compact)
-        dates_k = _get_open_dates_from_db(end_compact, days)
-        if len(dates_k) < days:
-            dates_k = _get_open_dates(pro, end_compact, days)
-        dates_k = dates_k
-        conn = _get_db_conn()
-        history: List[Dict[str, Any]] = []
-        if conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    """
-                    SELECT to_char(trade_date, 'YYYY-MM-DD') AS "date", amount, rank
-                    FROM stock_rankings
-                    WHERE code = %s AND trade_date BETWEEN %s::date - (%s::int - 1) * INTERVAL '1 day' AND %s::date
-                    ORDER BY trade_date ASC
-                    """,
-                    (code, _compact_to_date(dates_k[-1]), days, _compact_to_date(dates_k[-1])),
-                )
-                rows = cur.fetchall()
-                if rows:
-                    history = rows
-        if not history:
-            name_map = _stock_name_map()
-            for d in dates_k:
-                df = pro.daily(trade_date=d)
-                if df.empty:
-                    continue
-                recs = _build_daily_records_from_df(df, name_map, _compact_to_date(d))
-                _upsert_rankings(_compact_to_date(d), recs)
-                idx_map = {r['code']: i + 1 for i, r in enumerate(recs)}
-                r = next((x for x in recs if x['code'] == code), None)
-                if r:
-                    history.append({'date': r['date'], 'amount': r['amount'], 'rank': idx_map.get(code)})
-            history = sorted(history, key=lambda x: x['date'])
-        return jsonify({'code': code, 'days': days, 'history': history})
+            with conn.cursor() as cur:
+                cur.execute("SELECT MAX(trade_date) FROM stock_rankings")
+                row = cur.fetchone()
+                end_date = row[0] if row and row[0] else None
+            if not end_date:
+                return jsonify({'code': code, 'name': '', 'days': days, 'history': [], 'message': 'need_ingest'}), 200
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT trade_date
+                FROM stock_rankings
+                WHERE trade_date <= %s
+                ORDER BY trade_date DESC
+                LIMIT %s
+                """,
+                (end_date, days),
+            )
+            date_rows = cur.fetchall()
+        if not date_rows:
+            return jsonify({'code': code, 'name': '', 'days': days, 'history': [], 'message': 'need_ingest'}), 200
+        dates_list = [dr[0] for dr in reversed(date_rows)]
+        placeholders = ','.join(['%s'] * len(dates_list))
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"""
+                SELECT to_char(trade_date, 'YYYY-MM-DD') AS "date",
+                       amount,
+                       rank,
+                       code,
+                       name
+                FROM stock_rankings
+                WHERE code = %s AND trade_date IN ({placeholders})
+                ORDER BY trade_date ASC
+                """,
+                (code, *dates_list),
+            )
+            rows = cur.fetchall()
+        # 固定最近交易日序列，缺失填充 amount=0, rank=NULL
+        seq = [d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d) for d in dates_list]
+        row_map = {r['date']: r for r in rows}
+        name_val = rows[0]['name'] if rows else ''
+        history = [
+            {
+                'date': dstr,
+                'amount': int(row_map.get(dstr, {}).get('amount', 0)),
+                'rank': row_map.get(dstr, {}).get('rank', None)
+            }
+            for dstr in seq
+        ]
+        return jsonify({'code': code, 'name': name_val, 'days': days, 'history': history})
     except Exception as e:
-        return jsonify({'code': '', 'days': 0, 'history': [], 'message': str(e)})
+        return jsonify({'code': '', 'name': '', 'days': 0, 'history': [], 'message': str(e)})
 
 @app.route('/api/admin/ingest', methods=['GET', 'POST'])
 def ingest_bulk():
