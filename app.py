@@ -587,6 +587,9 @@ def get_stock_history():
 @app.route('/api/admin/ingest', methods=['GET', 'POST'])
 def ingest_bulk():
     try:
+        conn = _get_db_conn()
+        if not conn:
+            return jsonify({'message': '数据库连接失败: 未检测到有效的 DATABASE_URL', 'exchange': '', 'start': '', 'end': '', 'days': 0, 'rows': 0}), 500
         start = request.args.get('start')
         end = request.args.get('end')
         limit = int(request.args.get('limit', '200'))
@@ -603,7 +606,7 @@ def ingest_bulk():
         cal = cal.sort_values(by='cal_date')
         open_dates = cal['cal_date'].tolist()
         if not open_dates:
-            return jsonify({'exchange': exchange, 'start': start, 'end': end, 'days': 0, 'rows': 0})
+            return jsonify({'exchange': exchange, 'start': start, 'end': end, 'days': 0, 'rows': 0, 'message': '区间内无开放日'})
         name_map = _stock_name_map()
         total_rows = 0
         days_count = 0
@@ -616,9 +619,67 @@ def ingest_bulk():
             _upsert_rankings(_compact_to_date(d), recs_ingest)
             total_rows += len(recs_ingest)
             days_count += 1
-        return jsonify({'exchange': exchange, 'start': start, 'end': end, 'days': days_count, 'rows': total_rows})
+        return jsonify({'exchange': exchange, 'start': start, 'end': end, 'days': days_count, 'rows': total_rows, 'db_connected': True})
     except Exception as e:
         return jsonify({'message': str(e), 'exchange': '', 'start': '', 'end': '', 'days': 0, 'rows': 0})
+
+@app.route('/api/admin/rankings/stats')
+def rankings_stats():
+    try:
+        start = request.args.get('start')
+        end = request.args.get('end')
+        if not start or not end:
+            return jsonify({'message': '缺少 start/end 参数'}), 400
+        conn = _get_db_conn()
+        if not conn:
+            return jsonify({'message': '数据库连接失败'}), 500
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT trade_date AS date, COUNT(*) AS count
+                FROM stock_rankings
+                WHERE trade_date BETWEEN %s AND %s
+                GROUP BY trade_date
+                ORDER BY trade_date
+                """,
+                (start, end),
+            )
+            rows = cur.fetchall()
+        return jsonify({'start': start, 'end': end, 'stats': rows})
+    except Exception as e:
+        return jsonify({'message': str(e), 'start': '', 'end': '', 'stats': []})
+
+@app.route('/api/admin/calendar/stats')
+def calendar_stats():
+    try:
+        exchange = request.args.get('exchange', 'SSE')
+        conn = _get_db_conn()
+        if not conn:
+            return jsonify({'message': '数据库连接失败'}), 500
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT MIN(cal_date) AS min_date, MAX(cal_date) AS max_date, COUNT(*) AS total
+                FROM trading_calendar
+                WHERE exchange = %s AND is_open = true
+                """,
+                (exchange,),
+            )
+            agg = cur.fetchone()
+            cur.execute(
+                """
+                SELECT cal_date AS date
+                FROM trading_calendar
+                WHERE exchange = %s AND is_open = true
+                ORDER BY cal_date DESC
+                LIMIT 10
+                """,
+                (exchange,),
+            )
+            last10 = cur.fetchall()
+        return jsonify({'exchange': exchange, 'aggregate': agg, 'last10': last10})
+    except Exception as e:
+        return jsonify({'message': str(e), 'exchange': '', 'aggregate': {}, 'last10': []})
 
 if __name__ == '__main__':
     _ensure_db_schema()
