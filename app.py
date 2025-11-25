@@ -497,93 +497,71 @@ def get_top_streak():
         date_arg = request.args.get('date')
         db_only_arg = request.args.get('db_only', '1')
         db_only = db_only_arg.lower() in ('1', 'true', 'yes')
-        ts_mod = _load_tushare()
-        token = os.getenv('TUSHARE_TOKEN')
-        pro = ts_mod.pro_api(token) if token else ts_mod.pro_api()
+        conn = _get_db_conn()
+        if not conn:
+            return jsonify({'date': '', 'k': 0, 'limit': 0, 'list': [], 'message': '数据库连接失败'}), 500
         if date_arg:
             end_date = date_arg
-            end_compact = _date_to_compact(date_arg)
         else:
-            today = datetime.now().strftime('%Y%m%d')
-            cal = pro.trade_cal(exchange='SSE', start_date='20000101', end_date=today, is_open=1)
-            cal = cal.sort_values(by='cal_date')
-            open_dates = cal['cal_date'].tolist()
-            d = open_dates[-1] if open_dates else today
-            end_compact = d
-            end_date = _compact_to_date(d)
-        _sync_calendar(pro, '20000101', end_compact)
-        dates_k = _get_open_dates_from_db(end_compact, k)
-        if len(dates_k) < k:
-            if db_only:
-                return jsonify({'date': end_date, 'k': k, 'limit': limit, 'list': [], 'message': 'need_ingest'}), 400
-            dates_k = _get_open_dates(pro, end_compact, k)
-        if not dates_k:
-            return jsonify({'date': end_date, 'k': k, 'limit': limit, 'list': []})
-        conn = _get_db_conn()
-        if conn:
-            dates_list = [_compact_to_date(d) for d in dates_k]
-            placeholders = ','.join(['%s'] * len(dates_list))
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT code
-                    FROM stock_rankings
-                    WHERE trade_date IN ({placeholders}) AND rank <= %s
-                    GROUP BY code
-                    HAVING COUNT(DISTINCT trade_date) = %s
-                    """,
-                    (*dates_list, limit, k),
-                )
-                rows = cur.fetchall()
-                codes = [r[0] for r in rows]
-            if not codes:
-                if db_only:
-                    return jsonify({'date': _compact_to_date(dates_k[-1]), 'k': k, 'limit': limit, 'list': [], 'message': 'need_ingest'}), 200
-                name_map = _stock_name_map()
-                for d in dates_k:
-                    df = pro.daily(trade_date=d)
-                    if df.empty:
-                        continue
-                    recs = _build_daily_records_from_df(df, name_map, _compact_to_date(d))
-                    _upsert_rankings(_compact_to_date(d), recs[:limit])
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"""
-                        SELECT code
-                        FROM stock_rankings
-                        WHERE trade_date IN ({placeholders}) AND rank <= %s
-                        GROUP BY code
-                        HAVING COUNT(DISTINCT trade_date) = %s
-                        """,
-                        (*dates_list, limit, k),
-                    )
-                    rows = cur.fetchall()
-                    codes = [r[0] for r in rows]
-            if not codes:
-                return jsonify({'date': _compact_to_date(dates_k[-1]), 'k': k, 'limit': limit, 'list': []})
-            codes_placeholders = ','.join(['%s'] * len(codes))
-            last_date = _compact_to_date(dates_k[-1])
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    f"""
-                    SELECT code,
-                           name,
-                           price::float8 AS price,
-                           change::float8 AS change,
-                           change_percent::float8 AS "changePercent",
-                           volume,
-                           amount,
-                           to_char(trade_date, 'YYYY-MM-DD') AS "date",
-                           rank
-                    FROM stock_rankings
-                    WHERE trade_date = %s AND rank <= %s AND code IN ({codes_placeholders})
-                    ORDER BY rank ASC
-                    """,
-                    (last_date, limit, *codes),
-                )
-                result_rows = cur.fetchall()
-            return jsonify({'date': last_date, 'k': k, 'limit': limit, 'list': result_rows})
-        return jsonify({'date': end_date, 'k': k, 'limit': limit, 'list': []})
+                cur.execute("SELECT MAX(trade_date) FROM stock_rankings")
+                row = cur.fetchone()
+                end_date = row[0] if row and row[0] else None
+            if not end_date:
+                return jsonify({'date': '', 'k': k, 'limit': limit, 'list': [], 'message': 'need_ingest'}), 200
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT trade_date
+                FROM stock_rankings
+                WHERE trade_date <= %s
+                ORDER BY trade_date DESC
+                LIMIT %s
+                """,
+                (end_date, k),
+            )
+            date_rows = cur.fetchall()
+        if not date_rows or len(date_rows) < k:
+            return jsonify({'date': end_date, 'k': k, 'limit': limit, 'list': [], 'message': 'need_ingest'}), 200
+        dates_list = [dr[0] for dr in reversed(date_rows)]
+        placeholders = ','.join(['%s'] * len(dates_list))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT code
+                FROM stock_rankings
+                WHERE trade_date IN ({placeholders}) AND rank <= %s
+                GROUP BY code
+                HAVING COUNT(DISTINCT trade_date) = %s
+                """,
+                (*dates_list, limit, k),
+            )
+            rows = cur.fetchall()
+            codes = [r[0] for r in rows]
+        if not codes:
+            return jsonify({'date': dates_list[-1], 'k': k, 'limit': limit, 'list': []})
+        codes_placeholders = ','.join(['%s'] * len(codes))
+        last_date = dates_list[-1]
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"""
+                SELECT code,
+                       name,
+                       price::float8 AS price,
+                       change::float8 AS change,
+                       change_percent::float8 AS "changePercent",
+                       volume,
+                       amount,
+                       to_char(trade_date, 'YYYY-MM-DD') AS "date",
+                       rank
+                FROM stock_rankings
+                WHERE trade_date = %s AND rank <= %s AND code IN ({codes_placeholders})
+                ORDER BY rank ASC
+                """,
+                (last_date, limit, *codes),
+            )
+            result_rows = cur.fetchall()
+        return jsonify({'date': last_date, 'k': k, 'limit': limit, 'list': result_rows})
     except Exception as e:
         return jsonify({'date': '', 'k': 0, 'limit': 0, 'list': [], 'message': str(e)})
 
