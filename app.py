@@ -106,6 +106,16 @@ def _ensure_db_schema():
             ON stock_rankings (code, trade_date);
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stock_theme (
+              code text PRIMARY KEY,
+              name text,
+              theme text,
+              updated_at timestamptz DEFAULT now()
+            );
+            """
+        )
 
 try:
     _ensure_db_schema()
@@ -774,3 +784,144 @@ if __name__ == '__main__':
     _ensure_db_schema()
     port = int(os.getenv('PORT', '5000'))
     app.run(host='0.0.0.0', port=port, debug=False)
+def _classify_theme_with_gemini(name: str, code: str) -> str:
+    try:
+        api_key = os.getenv('GOOGLE_API_KEY')
+        if not api_key:
+            return '未知'
+        import json
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}"
+        prompt = (
+            "请用一个词输出该股票的题材/板块（例如：白酒、半导体、银行、保险、医药、新能源、军工、地产、汽车、AI等）。"
+            f" 股票代码：{code}，名称：{name}。只返回题材名，不要解释。"
+        )
+        body = {
+            "contents": [{"parts": [{"text": prompt}]}]
+        }
+        req = Request(url, data=json.dumps(body).encode('utf-8'), headers={'Content-Type': 'application/json'})
+        try:
+            resp = urlopen(req, timeout=12)
+            data = json.loads(resp.read().decode('utf-8'))
+            text = (
+                data.get('candidates', [{}])[0]
+                    .get('content', {})
+                    .get('parts', [{}])[0]
+                    .get('text', '')
+            )
+            theme = (text or '未知').strip().replace('\n', '').replace('：', ':')
+            if len(theme) > 20:
+                theme = theme[:20]
+            return theme or '未知'
+        except URLError:
+            return '未知'
+    except Exception:
+        return '未知'
+
+def _get_theme_for(code: str) -> str:
+    conn = _get_db_conn()
+    if not conn:
+        return '未知'
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT theme FROM stock_theme WHERE code = %s", (code,))
+        row = cur.fetchone()
+        return row['theme'] if row and row.get('theme') else '未知'
+
+def _upsert_theme(code: str, name: str, theme: str):
+    conn = _get_db_conn()
+    if not conn:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO stock_theme (code, name, theme)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (code) DO UPDATE SET
+              name = EXCLUDED.name,
+              theme = EXCLUDED.theme,
+              updated_at = now()
+            """,
+            (code, name, theme),
+        )
+
+@app.route('/api/ai/classify_theme', methods=['POST'])
+def classify_theme():
+    try:
+        payload = request.get_json(silent=True) or {}
+        items = payload.get('items', [])
+        results = []
+        for it in items:
+            code = str(it.get('code', ''))
+            name = str(it.get('name', ''))
+            if not code:
+                continue
+            theme = _get_theme_for(code)
+            if theme == '未知':
+                theme = _classify_theme_with_gemini(name, code)
+                _upsert_theme(code, name, theme)
+            results.append({ 'code': code, 'name': name, 'theme': theme })
+        return jsonify({ 'items': results })
+    except Exception as e:
+        return jsonify({ 'items': [], 'message': str(e) })
+
+@app.route('/api/stats/themes')
+def theme_stats():
+    try:
+        date = request.args.get('date')
+        limit = int(request.args.get('limit', '200'))
+        if not date:
+            return jsonify({ 'date': '', 'limit': limit, 'stats': [] })
+        conn = _get_db_conn()
+        if not conn:
+            return jsonify({'date': date, 'limit': limit, 'stats': [], 'message': '数据库连接失败'}), 500
+        # 取当日前N名
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT code, name, amount, rank
+                FROM stock_rankings
+                WHERE trade_date = %s AND rank <= %s
+                ORDER BY rank ASC
+                """,
+                (date, limit),
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return jsonify({ 'date': date, 'limit': limit, 'stats': [] })
+        # 确保有题材分类
+        for r in rows:
+            theme = _get_theme_for(r['code'])
+            if theme == '未知':
+                t = _classify_theme_with_gemini(r.get('name') or '', r['code'])
+                _upsert_theme(r['code'], r.get('name') or '', t)
+        # 聚合
+        conn = _get_db_conn()
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT st.theme,
+                       AVG(sr.rank)::float8 AS avg_rank,
+                       SUM(sr.amount)::bigint AS total_amount
+                FROM stock_rankings sr
+                JOIN stock_theme st ON st.code = sr.code
+                WHERE sr.trade_date = %s AND sr.rank <= %s
+                GROUP BY st.theme
+                ORDER BY total_amount DESC
+                """,
+                (date, limit),
+            )
+            agg = cur.fetchall()
+        total = sum(int(a['total_amount']) for a in agg) or 1
+        stats = [
+            {
+                'theme': a['theme'],
+                'avgRank': float(a['avg_rank']),
+                'totalAmount': int(a['total_amount']),
+                'amountShare': round(int(a['total_amount']) / total * 100, 2)
+            }
+            for a in agg
+        ]
+        return jsonify({ 'date': date, 'limit': limit, 'stats': stats })
+    except Exception as e:
+        return jsonify({ 'date': '', 'limit': 0, 'stats': [], 'message': str(e) })
