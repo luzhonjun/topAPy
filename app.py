@@ -780,10 +780,7 @@ def ingest_recent():
     except Exception as e:
         return jsonify({'message': str(e), 'days': 0, 'rows': 0})
 
-if __name__ == '__main__':
-    _ensure_db_schema()
-    port = int(os.getenv('PORT', '5000'))
-    app.run(host='0.0.0.0', port=port, debug=False)
+ 
 def _classify_theme_with_gemini(name: str, code: str) -> str:
     try:
         api_key = os.getenv('GOOGLE_API_KEY')
@@ -866,7 +863,6 @@ def classify_theme():
         return jsonify({ 'items': [], 'message': str(e) })
 
 @app.route('/api/stats/themes')
-@app.route('/api/stats/themes/')
 def theme_stats():
     try:
         date = request.args.get('date')
@@ -940,3 +936,8 @@ def list_routes():
         return jsonify({'routes': rules})
     except Exception as e:
         return jsonify({'routes': [], 'message': str(e)})
+
+if __name__ == '__main__':
+    _ensure_db_schema()
+    port = int(os.getenv('PORT', '5000'))
+    app.run(host='0.0.0.0', port=port, debug=False)
