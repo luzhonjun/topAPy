@@ -786,41 +786,32 @@ def _classify_theme_with_gemini(name: str, code: str) -> str:
         api_key = os.getenv('GOOGLE_API_KEY')
         if not api_key:
             return '未知'
-        import json
-        from urllib.request import Request, urlopen
-        from urllib.error import URLError
-        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}"
+        from google.genai import Client
+        from google.genai.types import GenerateContentConfig, Content, Part
+        client = Client(api_key=api_key)
         prompt = (
             "请用一个词输出该股票的题材/板块（例如：白酒、半导体、银行、保险、医药、新能源、军工、地产、汽车、AI等）。"
             f" 股票代码：{code}，名称：{name}。只返回题材名，不要解释。"
         )
-        body = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "responseMimeType": "text/plain",
-                "temperature": 0,
-                "topP": 0.1,
-                "maxOutputTokens": 20
-            }
-        }
-        req = Request(url, data=json.dumps(body).encode('utf-8'), headers={'Content-Type': 'application/json'})
+        contents = [Content(role='user', parts=[Part.from_text(prompt)])]
+        config = GenerateContentConfig(
+            response_mime_type='text/plain',
+            temperature=0.0,
+            top_p=0.1,
+            max_output_tokens=20,
+        )
         try:
-            resp = urlopen(req, timeout=12)
-            raw = resp.read().decode('utf-8')
-            data = json.loads(raw)
-            candidates = data.get('candidates') or []
-            text = ''
-            if candidates:
-                content = candidates[0].get('content') or {}
-                parts = content.get('parts') or []
-                if parts:
-                    part0 = parts[0]
-                    text = part0.get('text') or ''
+            resp = client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=contents,
+                config=config,
+            )
+            text = getattr(resp, 'text', '') or ''
             theme = (text or '未知').strip().replace('\n', '').replace('：', ':')
             if len(theme) > 20:
                 theme = theme[:20]
             return theme or '未知'
-        except URLError:
+        except Exception:
             return '未知'
     except Exception:
         return '未知'
@@ -945,6 +936,52 @@ def list_routes():
         return jsonify({'routes': rules})
     except Exception as e:
         return jsonify({'routes': [], 'message': str(e)})
+
+@app.route('/api/admin/ai/status')
+def ai_status():
+    try:
+        k = os.getenv('GOOGLE_API_KEY') or ''
+        return jsonify({'has_key': bool(k), 'key_len': len(k), 'model': 'gemini-1.5-flash'})
+    except Exception as e:
+        return jsonify({'has_key': False, 'key_len': 0, 'model': '', 'message': str(e)})
+
+@app.route('/api/admin/ai/test')
+def ai_test():
+    try:
+        name = request.args.get('name') or '贵州茅台'
+        code = request.args.get('code') or '600519'
+        api_key = os.getenv('GOOGLE_API_KEY')
+        if not api_key:
+            return jsonify({'ok': False, 'theme': '未知', 'message': 'missing GOOGLE_API_KEY'})
+        from google.genai import Client
+        from google.genai.types import GenerateContentConfig, Content, Part
+        client = Client(api_key=api_key)
+        prompt = (
+            "请用一个词输出该股票的题材/板块（例如：白酒、半导体、银行、保险、医药、新能源、军工、地产、汽车、AI等）。"
+            f" 股票代码：{code}，名称：{name}。只返回题材名，不要解释。"
+        )
+        contents = [Content(role='user', parts=[Part.from_text(prompt)])]
+        config = GenerateContentConfig(
+            response_mime_type='text/plain',
+            temperature=0.0,
+            top_p=0.1,
+            max_output_tokens=20,
+        )
+        try:
+            resp = client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=contents,
+                config=config,
+            )
+            text = getattr(resp, 'text', '') or ''
+            theme = (text or '未知').strip().replace('\n', '').replace('：', ':')
+            if len(theme) > 20:
+                theme = theme[:20]
+            return jsonify({'ok': True, 'theme': theme})
+        except Exception as e:
+            return jsonify({'ok': False, 'theme': '未知', 'message': str(e)})
+    except Exception as e:
+        return jsonify({'ok': False, 'theme': '未知', 'message': str(e)})
 
 if __name__ == '__main__':
     _ensure_db_schema()

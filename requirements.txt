@@ -2,3 +2,4 @@ flask
 flask-cors
 tushare
 psycopg[binary]
+google-genai
