@@ -795,18 +795,27 @@ def _classify_theme_with_gemini(name: str, code: str) -> str:
             f" 股票代码：{code}，名称：{name}。只返回题材名，不要解释。"
         )
         body = {
-            "contents": [{"parts": [{"text": prompt}]}]
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "text/plain",
+                "temperature": 0,
+                "topP": 0.1,
+                "maxOutputTokens": 20
+            }
         }
         req = Request(url, data=json.dumps(body).encode('utf-8'), headers={'Content-Type': 'application/json'})
         try:
             resp = urlopen(req, timeout=12)
-            data = json.loads(resp.read().decode('utf-8'))
-            text = (
-                data.get('candidates', [{}])[0]
-                    .get('content', {})
-                    .get('parts', [{}])[0]
-                    .get('text', '')
-            )
+            raw = resp.read().decode('utf-8')
+            data = json.loads(raw)
+            candidates = data.get('candidates') or []
+            text = ''
+            if candidates:
+                content = candidates[0].get('content') or {}
+                parts = content.get('parts') or []
+                if parts:
+                    part0 = parts[0]
+                    text = part0.get('text') or ''
             theme = (text or '未知').strip().replace('\n', '').replace('：', ':')
             if len(theme) > 20:
                 theme = theme[:20]
@@ -872,7 +881,7 @@ def theme_stats():
         conn = _get_db_conn()
         if not conn:
             return jsonify({'date': date, 'limit': limit, 'stats': [], 'message': '数据库连接失败'}), 500
-        # 取当日前N名
+        # 取当日前N名（仅DB，不回源）
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
@@ -897,13 +906,13 @@ def theme_stats():
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                SELECT st.theme,
+                SELECT COALESCE(st.theme, '未知') AS theme,
                        AVG(sr.rank)::float8 AS avg_rank,
                        SUM(sr.amount)::bigint AS total_amount
                 FROM stock_rankings sr
-                JOIN stock_theme st ON st.code = sr.code
+                LEFT JOIN stock_theme st ON st.code = sr.code
                 WHERE sr.trade_date = %s AND sr.rank <= %s
-                GROUP BY st.theme
+                GROUP BY COALESCE(st.theme, '未知')
                 ORDER BY total_amount DESC
                 """,
                 (date, limit),
