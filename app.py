@@ -866,6 +866,7 @@ def classify_theme():
         return jsonify({ 'items': [], 'message': str(e) })
 
 @app.route('/api/stats/themes')
+@app.route('/api/stats/themes/')
 def theme_stats():
     try:
         date = request.args.get('date')
@@ -925,3 +926,17 @@ def theme_stats():
         return jsonify({ 'date': date, 'limit': limit, 'stats': stats })
     except Exception as e:
         return jsonify({ 'date': '', 'limit': 0, 'stats': [], 'message': str(e) })
+
+@app.route('/api/admin/routes')
+def list_routes():
+    try:
+        rules = []
+        for r in app.url_map.iter_rules():
+            rules.append({
+                'rule': str(r),
+                'endpoint': r.endpoint,
+                'methods': sorted(list(r.methods or []))
+            })
+        return jsonify({'routes': rules})
+    except Exception as e:
+        return jsonify({'routes': [], 'message': str(e)})
